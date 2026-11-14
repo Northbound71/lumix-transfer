@@ -1,0 +1,304 @@
+package dk.lumixtransfer
+
+import android.util.Xml
+import org.xmlpull.v1.XmlPullParser
+import java.io.IOException
+import java.io.StringReader
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.SocketTimeoutException
+import java.net.URL
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
+
+/** En fil på kameraet (billede eller video). */
+data class RemoteFile(
+    val title: String,
+    val url: String,
+    val size: Long,
+    val date: String,
+    val dateMillis: Long,
+    val mime: String
+) {
+    /** Bruges til at huske hvilke filer der allerede er hentet. */
+    val key: String get() = "$title|$size|$date"
+
+    val fileName: String
+        get() {
+            val base = (if (title.isBlank()) "lumix_$size" else title)
+                .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            val hasExt = base.substringAfterLast('.', "").length in 2..4
+            if (hasExt) return base
+            val urlName = url.substringBefore('?').substringAfterLast('/')
+            val urlExt = if (urlName.contains('.')) urlName.substringAfterLast('.') else ""
+            val ext = when {
+                urlExt.length in 2..4 -> urlExt
+                mime == "image/jpeg" -> "jpg"
+                mime == "video/mp4" -> "mp4"
+                mime == "video/quicktime" -> "mov"
+                mime == "image/x-panasonic-rw2" -> "rw2"
+                else -> "bin"
+            }
+            return "$base.$ext"
+        }
+}
+
+class CameraClient(private val host: String, private val log: (String) -> Unit) {
+
+    private val controlUrl = "http://$host:60606/Server0/CDS_control"
+
+    /**
+     * Beder kameraet om adgang. Returnerer kameraets svar, eller null hvis
+     * kameraet ikke kunne nås overhovedet.
+     */
+    fun handshake(uuid: String): String? {
+        val name = URLEncoder.encode("Lumix Transfer", "UTF-8")
+        val url = "http://$host/cam.cgi?mode=accctrl&type=req_acc&value=$uuid&value2=$name"
+        return try {
+            val reply = httpGet(url, 3500)
+            log("Kamera ($host) svarer: ${reply.replace("\n", " ").take(160)}")
+            reply
+        } catch (e: Exception) {
+            log("Ingen kontakt til $host: ${e.message}")
+            null
+        }
+    }
+
+    /** Henter alle filer fra kameraet ved at gå rekursivt gennem mapperne. */
+    fun listAll(onProgress: (Int) -> Unit): List<RemoteFile> {
+        val out = ArrayList<RemoteFile>()
+        walk("0", out, onProgress, 0)
+        return out
+    }
+
+    private fun walk(id: String, out: MutableList<RemoteFile>, onProgress: (Int) -> Unit, depth: Int) {
+        if (depth > 8) return
+        var start = 0
+        while (true) {
+            val page = browse(id, start, PAGE_SIZE)
+            for (e in page.entries) {
+                if (e.isContainer) {
+                    walk(e.id, out, onProgress, depth + 1)
+                } else if (e.file != null) {
+                    out.add(e.file)
+                    onProgress(out.size)
+                }
+            }
+            start += page.returned
+            if (page.returned == 0) break
+            if (page.total in 1..start) break
+            if (page.total == 0 && page.returned < PAGE_SIZE) break
+        }
+    }
+
+    private class Entry(val isContainer: Boolean, val id: String, val file: RemoteFile?)
+    private class Page(val entries: List<Entry>, val returned: Int, val total: Int)
+
+    private fun browse(objectId: String, start: Int, count: Int): Page {
+        val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>" +
+            "<u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\" " +
+            "xmlns:pana=\"urn:schemas-panasonic-com:pana\">" +
+            "<ObjectID>$objectId</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag>" +
+            "<Filter>*</Filter><StartingIndex>$start</StartingIndex>" +
+            "<RequestedCount>$count</RequestedCount><SortCriteria></SortCriteria>" +
+            "<pana:X_FromCP>LumixLink2.0</pana:X_FromCP></u:Browse></s:Body></s:Envelope>"
+
+        val soap = post(controlUrl, body)
+
+        var result = ""
+        var returned = 0
+        var total = 0
+        val p = Xml.newPullParser()
+        p.setInput(StringReader(soap))
+        var ev = p.eventType
+        while (ev != XmlPullParser.END_DOCUMENT) {
+            if (ev == XmlPullParser.START_TAG) {
+                when (localName(p.name)) {
+                    "Result" -> result = p.nextText()
+                    "NumberReturned" -> returned = p.nextText().trim().toIntOrNull() ?: 0
+                    "TotalMatches" -> total = p.nextText().trim().toIntOrNull() ?: 0
+                }
+            }
+            ev = p.next()
+        }
+        val entries = parseDidl(result)
+        // Hvis kameraet ikke oplyser NumberReturned, brug antal fundne poster.
+        if (returned == 0 && entries.isNotEmpty()) returned = entries.size
+        return Page(entries, returned, total)
+    }
+
+    private fun parseDidl(didl: String): List<Entry> {
+        if (didl.isBlank()) return emptyList()
+        val list = ArrayList<Entry>()
+        val p = Xml.newPullParser()
+        p.setInput(StringReader(didl))
+
+        var inEntry = false
+        var isContainer = false
+        var id = ""
+        var title = ""
+        var date = ""
+        var bestUrl = ""
+        var bestSize = -1L
+        var bestMime = ""
+        var bestIsThumb = true
+
+        var ev = p.eventType
+        while (ev != XmlPullParser.END_DOCUMENT) {
+            if (ev == XmlPullParser.START_TAG) {
+                when (localName(p.name)) {
+                    "container", "item" -> {
+                        inEntry = true
+                        isContainer = localName(p.name) == "container"
+                        id = p.getAttributeValue(null, "id") ?: ""
+                        title = ""
+                        date = ""
+                        bestUrl = ""
+                        bestSize = -1L
+                        bestMime = ""
+                        bestIsThumb = true
+                    }
+                    "title" -> if (inEntry) title = p.nextText().trim()
+                    "date" -> if (inEntry) date = p.nextText().trim()
+                    "res" -> if (inEntry) {
+                        val size = p.getAttributeValue(null, "size")?.toLongOrNull() ?: 0L
+                        val proto = p.getAttributeValue(null, "protocolInfo") ?: ""
+                        val url = p.nextText().trim()
+                        val isThumb = proto.contains("_TN") || proto.contains("_SM_ICO") ||
+                            proto.contains("_LRG_ICO")
+                        // Vælg den originale fil: ikke-miniature først, derefter størst.
+                        val better = url.isNotEmpty() && (
+                            bestUrl.isEmpty() ||
+                                (bestIsThumb && !isThumb) ||
+                                (bestIsThumb == isThumb && size > bestSize)
+                            )
+                        if (better) {
+                            bestUrl = url
+                            bestSize = size
+                            bestIsThumb = isThumb
+                            bestMime = proto.split(":").getOrNull(2) ?: ""
+                        }
+                    }
+                }
+            } else if (ev == XmlPullParser.END_TAG) {
+                val n = localName(p.name)
+                if ((n == "container" || n == "item") && inEntry) {
+                    inEntry = false
+                    if (isContainer) {
+                        list.add(Entry(true, id, null))
+                    } else if (bestUrl.isNotEmpty()) {
+                        list.add(
+                            Entry(
+                                false, id,
+                                RemoteFile(
+                                    title, bestUrl, maxOf(bestSize, 0L), date,
+                                    parseDate(date), bestMime
+                                )
+                            )
+                        )
+                    }
+                }
+            }
+            ev = p.next()
+        }
+        return list
+    }
+
+    private fun parseDate(s: String): Long {
+        if (s.length < 19) return 0L
+        return try {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).parse(s.take(19))?.time ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    private fun localName(n: String?): String = (n ?: "").substringAfter(':')
+
+    private fun httpGet(url: String, timeoutMs: Int): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = timeoutMs
+        c.readTimeout = timeoutMs
+        c.setRequestProperty("User-Agent", "LumixTransfer/1.0")
+        try {
+            val code = c.responseCode
+            val stream = if (code in 200..299) c.inputStream else c.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            if (code !in 200..299) throw IOException("HTTP $code")
+            return text
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    private fun post(url: String, body: String): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = 6000
+        c.readTimeout = 20000
+        c.requestMethod = "POST"
+        c.doOutput = true
+        c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
+        c.setRequestProperty("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"")
+        c.setRequestProperty("User-Agent", "LumixTransfer/1.0")
+        try {
+            c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = c.responseCode
+            val stream = if (code in 200..299) c.inputStream else c.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            if (code !in 200..299) throw IOException("HTTP $code: ${text.take(160)}")
+            return text
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    companion object {
+        private const val PAGE_SIZE = 50
+
+        /** Leder efter kameraet på netværket via SSDP. Returnerer IP-adresse eller null. */
+        fun discover(log: (String) -> Unit, timeoutMs: Int = 3000): String? {
+            val msg = ("M-SEARCH * HTTP/1.1\r\n" +
+                "HOST: 239.255.255.250:1900\r\n" +
+                "MAN: \"ssdp:discover\"\r\n" +
+                "MX: 1\r\n" +
+                "ST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n").toByteArray()
+            val group = InetAddress.getByName("239.255.255.250")
+            val locationRe = Regex("(?i)location:\\s*http://([^:/\\s]+)(:(\\d+))?")
+            try {
+                DatagramSocket().use { s ->
+                    s.soTimeout = 700
+                    repeat(2) { s.send(DatagramPacket(msg, msg.size, group, 1900)) }
+                    val end = System.currentTimeMillis() + timeoutMs
+                    val buf = ByteArray(2048)
+                    while (System.currentTimeMillis() < end) {
+                        try {
+                            val pkt = DatagramPacket(buf, buf.size)
+                            s.receive(pkt)
+                            val text = String(pkt.data, 0, pkt.length)
+                            val m = locationRe.find(text) ?: continue
+                            val ip = m.groupValues[1]
+                            val port = m.groupValues[3]
+                            val looksLikeLumix = port == "60606" ||
+                                text.contains("panasonic", ignoreCase = true) ||
+                                text.contains("lumix", ignoreCase = true)
+                            if (looksLikeLumix) {
+                                log("Fandt kamera via SSDP: $ip")
+                                return ip
+                            }
+                        } catch (e: SocketTimeoutException) {
+                            // fortsæt indtil tiden er gået
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                log("SSDP-søgning fejlede: ${e.message}")
+            }
+            return null
+        }
+    }
+}
