@@ -137,6 +137,27 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
         )
     }
 
+    /** Holder forbindelsen i live (som Panasonics app). Returnerer en kort status. */
+    fun keepAlive(): String =
+        try {
+            httpGet("http://$host/cam.cgi?mode=getstate&type=keep_alive", 2500)
+                .replace("\n", " ").trim().take(120)
+        } catch (e: Exception) {
+            "fejl: ${e.message}"
+        }
+
+    /** Genopretter forbindelsen efter fejl: ny godkendelse og skift til afspilning. */
+    fun reestablish(uuid: String) {
+        val a = awaitApproval(uuid, { }, { false })
+        log("Genopretter forbindelsen: ${if (a.ok) "ok" else a.message}")
+        try {
+            httpGet("http://$host/cam.cgi?mode=camcmd&value=playmode", 4000)
+        } catch (e: Exception) {
+            // ignorer
+        }
+        sleepMs(500)
+    }
+
     private fun sleepMs(ms: Long) {
         try {
             Thread.sleep(ms)

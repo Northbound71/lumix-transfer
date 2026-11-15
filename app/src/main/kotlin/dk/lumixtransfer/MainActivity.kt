@@ -30,6 +30,8 @@ import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
 
@@ -60,6 +62,12 @@ class MainActivity : Activity() {
     @Volatile
     private var cancelRequested = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var camClient: CameraClient? = null
+    private var keepAliveExec: ScheduledExecutorService? = null
+
+    @Volatile
+    private var lastProgress = 0L
+    private var lastKeepAlive = ""
     private val logBuffer = StringBuilder()
 
     private val prefs by lazy { getSharedPreferences("lumix", Context.MODE_PRIVATE) }
@@ -74,6 +82,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopKeepAlive()
         releaseNetwork()
         worker.shutdownNow()
     }
@@ -269,6 +278,33 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------- Forbindelse
 
+    private fun startKeepAlive(cam: CameraClient) {
+        stopKeepAlive()
+        camClient = cam
+        val exec = Executors.newSingleThreadScheduledExecutor()
+        keepAliveExec = exec
+        exec.scheduleWithFixedDelay({
+            try {
+                // Spring over mens der aktivt overføres data.
+                if (SystemClock.uptimeMillis() - lastProgress > 3000) {
+                    val r = cam.keepAlive()
+                    if (r != lastKeepAlive) {
+                        lastKeepAlive = r
+                        log("Keep-alive: $r")
+                    }
+                }
+            } catch (e: Exception) {
+                // ignorer
+            }
+        }, 2, 4, TimeUnit.SECONDS)
+    }
+
+    private fun stopKeepAlive() {
+        keepAliveExec?.shutdownNow()
+        keepAliveExec = null
+        camClient = null
+    }
+
     private fun releaseNetwork() {
         val cm = getSystemService(ConnectivityManager::class.java)
         networkCallback?.let {
@@ -301,6 +337,7 @@ class MainActivity : Activity() {
         refreshList()
         setStatus("Finder kameraets Wi-Fi …")
 
+        stopKeepAlive()
         releaseNetwork()
         val typedHost = hostField.text.toString().trim()
         val cm = getSystemService(ConnectivityManager::class.java)
@@ -417,6 +454,7 @@ class MainActivity : Activity() {
 
             val cam = CameraClient(finalHost, logger)
             val list = cam.listAll { n -> runOnUiThread { setStatus("Henter filliste … $n filer") } }
+            startKeepAlive(cam)
             val sorted = list.sortedByDescending { it.dateMillis }
             log("Fandt ${sorted.size} filer")
 
@@ -459,8 +497,9 @@ class MainActivity : Activity() {
                 if (cancelRequested) break
                 var lastUi = 0L
                 log("Henter ${f.fileName} (${i + 1}/${todo.size})")
-                val res = dl.download(f, { cancelRequested }) { got, total ->
+                val res = dl.download(f, { cancelRequested }, { got, total ->
                     val now = SystemClock.uptimeMillis()
+                    lastProgress = now
                     if (now - lastUi > 250 || (total > 0 && got >= total)) {
                         lastUi = now
                         val frac = if (total > 0) (got.toDouble() / total).coerceIn(0.0, 1.0) else 0.0
@@ -471,6 +510,12 @@ class MainActivity : Activity() {
                                 "${formatSize(got)}" + if (total > 0) " af ${formatSize(total)}" else ""
                         }
                     }
+                }, { camClient?.reestablish(uuid()) })
+                lastProgress = SystemClock.uptimeMillis() - 2000
+                try {
+                    Thread.sleep(400)
+                } catch (e: InterruptedException) {
+                    // ignorer
                 }
                 if (res.ok) {
                     ok++

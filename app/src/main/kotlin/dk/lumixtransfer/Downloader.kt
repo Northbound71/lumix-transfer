@@ -36,7 +36,8 @@ class Downloader(private val context: Context, private val log: (String) -> Unit
     fun download(
         f: RemoteFile,
         cancelled: () -> Boolean,
-        onProgress: (Long, Long) -> Unit
+        onProgress: (Long, Long) -> Unit,
+        recover: () -> Unit = {}
     ): Result {
         val resolver = context.contentResolver
         val mime = f.mime.ifEmpty { "application/octet-stream" }
@@ -88,6 +89,14 @@ class Downloader(private val context: Context, private val log: (String) -> Unit
                         }
                         val variant = (preferred + attempt) % VARIANTS
                         attempt++
+                        if (attempt == 3 || attempt == 6) {
+                            log("Genopretter forbindelsen til kameraet …")
+                            try {
+                                recover()
+                            } catch (e: Exception) {
+                                log("Genopretning fejlede: ${e.message}")
+                            }
+                        }
                         var resp: Response? = null
                         try {
                             resp = openGet(f.url, written, variant)
@@ -140,6 +149,10 @@ class Downloader(private val context: Context, private val log: (String) -> Unit
                             if (len >= 0 && !chunked && bodyRead < len) {
                                 throw IOException("Ufuldstændig overførsel ($bodyRead af $len)")
                             }
+                            if (len < 0 && !chunked && f.size > 0 && written < f.size) {
+                                throw IOException("Ufuldstændig overførsel ($written af ${f.size})")
+                            }
+                            log("${f.fileName}: hentet $written bytes (forventet ${if (f.size > 0) f.size.toString() else "?"})")
                             preferred = variant
                             success = true
                         } catch (e: IOException) {
