@@ -20,6 +20,7 @@ import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
@@ -51,6 +52,8 @@ class MainActivity : Activity() {
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
     private val adapter = FileAdapter()
+    private val thumbs = ThumbnailLoader({ log(it) }, { requestRedraw() })
+    private var redrawPending = false
 
     // Tilstand
     private var files: List<RemoteFile> = emptyList()
@@ -83,6 +86,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         stopKeepAlive()
+        thumbs.shutdown()
         releaseNetwork()
         worker.shutdownNow()
     }
@@ -213,11 +217,15 @@ class MainActivity : Activity() {
             val row = (convertView as? LinearLayout) ?: buildRow()
             val f = files[position]
             val cb = row.getChildAt(0) as CheckBox
-            val tv = row.getChildAt(1) as TextView
+            val img = row.getChildAt(1) as ImageView
+            val tv = row.getChildAt(2) as TextView
             cb.isChecked = selected.contains(f.key)
+            val bmp = thumbs.get(f)
+            if (bmp != null) img.setImageBitmap(bmp) else img.setImageDrawable(null)
             val done = if (doneKeys.contains(f.key)) "  ✓ hentet" else ""
+            val kind = if (f.mime.startsWith("video/")) " · video" else ""
             val date = f.date.replace('T', ' ').take(16)
-            tv.text = "${f.fileName}\n$date · ${formatSize(f.size)}$done"
+            tv.text = "${f.fileName}\n$date · ${formatSize(f.size)}$kind$done"
             return row
         }
 
@@ -231,8 +239,27 @@ class MainActivity : Activity() {
                 isClickable = false
                 isFocusable = false
             })
+            val img = ImageView(this@MainActivity).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setBackgroundColor(0xFFDDDDDD.toInt())
+            }
+            val lp = LinearLayout.LayoutParams(dp(72), dp(72))
+            lp.setMargins(dp(8), 0, dp(10), 0)
+            row.addView(img, lp)
             row.addView(TextView(this@MainActivity).apply { textSize = 14f })
             return row
+        }
+    }
+
+    /** Opdaterer listen når nye miniaturer er klar (højst hvert 200 ms). */
+    private fun requestRedraw() {
+        runOnUiThread {
+            if (redrawPending || !::listView.isInitialized) return@runOnUiThread
+            redrawPending = true
+            listView.postDelayed({
+                redrawPending = false
+                adapter.notifyDataSetChanged()
+            }, 200)
         }
     }
 
@@ -334,6 +361,7 @@ class MainActivity : Activity() {
         connecting = true
         files = emptyList()
         selected.clear()
+        thumbs.clearQueue()
         refreshList()
         setStatus("Finder kameraets Wi-Fi …")
 
@@ -482,6 +510,7 @@ class MainActivity : Activity() {
         val todo = files.filter { selected.contains(it.key) }
         if (todo.isEmpty() || downloading) return
         downloading = true
+        thumbs.paused = true
         cancelRequested = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         progressBar.visibility = View.VISIBLE
@@ -535,6 +564,7 @@ class MainActivity : Activity() {
             val stopped = cancelRequested
             runOnUiThread {
                 downloading = false
+                thumbs.paused = false
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 progressBar.visibility = View.GONE
                 progressText.visibility = View.GONE

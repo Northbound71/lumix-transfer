@@ -21,7 +21,8 @@ data class RemoteFile(
     val size: Long,
     val date: String,
     val dateMillis: Long,
-    val mime: String
+    val mime: String,
+    val thumbUrl: String = ""
 ) {
     /** Bruges til at huske hvilke filer der allerede er hentet. */
     val key: String get() = "$title|$size|$date"
@@ -51,6 +52,7 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
     private var controlUrl = "http://$host:60606/Server0/CDS_control"
     private var ua = CP_USER_AGENT
     private var includePana = true
+    private var loggedSample = false
 
     /**
      * Beder kameraet om adgang. Returnerer kameraets svar, eller null hvis
@@ -349,6 +351,10 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
         var bestSize = -1L
         var bestMime = ""
         var bestIsThumb = true
+        var thumbSmall = ""
+        var thumbLarge = ""
+        var albumArt = ""
+        val resInfo = StringBuilder()
 
         var ev = p.eventType
         while (ev != XmlPullParser.END_DOCUMENT) {
@@ -364,15 +370,24 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
                         bestSize = -1L
                         bestMime = ""
                         bestIsThumb = true
+                        thumbSmall = ""
+                        thumbLarge = ""
+                        albumArt = ""
+                        resInfo.setLength(0)
                     }
+                    "albumArtURI" -> if (inEntry) albumArt = p.nextText().trim()
                     "title" -> if (inEntry) title = p.nextText().trim()
                     "date" -> if (inEntry) date = p.nextText().trim()
                     "res" -> if (inEntry) {
                         val size = p.getAttributeValue(null, "size")?.toLongOrNull() ?: 0L
                         val proto = p.getAttributeValue(null, "protocolInfo") ?: ""
                         val url = p.nextText().trim()
+                        val pn = Regex("PANASONIC\\.COM_PN=([^;:]+)").find(proto)?.groupValues?.get(1) ?: ""
+                        if (resInfo.length < 600) resInfo.append(" | ").append(pn.ifEmpty { "?" }).append(' ').append(size)
+                        if (pn == "CAM_TN" && thumbSmall.isEmpty()) thumbSmall = url
+                        if (pn == "CAM_LRGTN" && thumbLarge.isEmpty()) thumbLarge = url
                         val isThumb = proto.contains("_TN") || proto.contains("_SM_ICO") ||
-                            proto.contains("_LRG_ICO")
+                            proto.contains("_LRG_ICO") || pn == "CAM_TN" || pn == "CAM_LRGTN"
                         // Vælg den originale fil: ikke-miniature først, derefter størst.
                         val better = url.isNotEmpty() && (
                             bestUrl.isEmpty() ||
@@ -394,12 +409,17 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
                     if (isContainer) {
                         list.add(Entry(true, id, null))
                     } else if (bestUrl.isNotEmpty()) {
+                        if (!loggedSample) {
+                            loggedSample = true
+                            log("Eksempel på filens ressourcer ($title):$resInfo")
+                        }
+                        val thumb = thumbSmall.ifEmpty { thumbLarge.ifEmpty { albumArt } }
                         list.add(
                             Entry(
                                 false, id,
                                 RemoteFile(
                                     title, bestUrl, maxOf(bestSize, 0L), date,
-                                    parseDate(date), bestMime
+                                    parseDate(date), bestMime, thumb
                                 )
                             )
                         )
