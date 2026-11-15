@@ -69,6 +69,82 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
         }
     }
 
+    class Approval(val ok: Boolean, val message: String)
+
+    /**
+     * Beder kameraet om adgang og venter, til kameraet har godkendt forbindelsen.
+     * Kameraet svarer "ok_under_research..." mens det afventer, og "ok" når det er klar.
+     */
+    fun awaitApproval(
+        uuid: String,
+        onWaiting: () -> Unit,
+        cancelled: () -> Boolean
+    ): Approval {
+        val name = URLEncoder.encode("Lumix Transfer", "UTF-8").replace("+", "%20")
+        val url = "http://$host/cam.cgi?mode=accctrl&type=req_acc&value=$uuid&value2=$name"
+        val deadline = System.currentTimeMillis() + 90_000
+        var notified = false
+        var lastWait = ""
+        while (System.currentTimeMillis() < deadline && !cancelled()) {
+            val raw = try {
+                httpGet(url, 4000)
+            } catch (e: Exception) {
+                log("Ingen kontakt under godkendelse: ${e.message}")
+                sleepMs(1000)
+                continue
+            }
+            val line = raw.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: ""
+            val result = Regex("<result>([^<]*)</result>").find(raw)?.groupValues?.get(1) ?: ""
+            val parts = line.split(",")
+            val code = (if (result.isNotEmpty()) result else parts[0]).lowercase(Locale.US)
+            val mode = parts.getOrNull(2)?.lowercase(Locale.US) ?: ""
+            when (code) {
+                "ok_under_research", "ok_under_research_no_msg" -> {
+                    if (lastWait != code) {
+                        log("Kameraet afventer godkendelse ($code)")
+                        lastWait = code
+                    }
+                    if (!notified) {
+                        notified = true
+                        onWaiting()
+                    }
+                    sleepMs(1000)
+                }
+                "ok" -> {
+                    log("Kameraet har godkendt forbindelsen (tilstand: ${mode.ifEmpty { "ukendt" }})")
+                    return if (mode == "upload" || mode == "upload_bt" || mode == "transfer") {
+                        Approval(
+                            false,
+                            "Kameraet står i '$mode'-tilstand. Slå kameraets Wi-Fi fra, og start " +
+                                "forfra med Ny forbindelse → Fjernoptagelse og visning (Remote shooting & view)."
+                        )
+                    } else {
+                        Approval(true, "")
+                    }
+                }
+                "err_user_refused" -> return Approval(false, "Forbindelsen blev afvist på kameraet.")
+                "err_others_requesting" -> return Approval(
+                    false,
+                    "Kameraet har en anden forbindelsesanmodning i gang. Slå kameraets Wi-Fi fra og til igen."
+                )
+                else -> return Approval(false, "Kameraet svarede uventet: ${line.take(80)}")
+            }
+        }
+        return Approval(
+            false,
+            if (cancelled()) "Afbrudt." else
+                "Kameraet godkendte ikke forbindelsen i tide. Tjek kameraets skærm, og prøv igen."
+        )
+    }
+
+    private fun sleepMs(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (e: InterruptedException) {
+            // ignorer
+        }
+    }
+
     /** Henter alle filer fra kameraet ved at gå rekursivt gennem mapperne. */
     fun listAll(onProgress: (Int) -> Unit): List<RemoteFile> {
         prepare()
@@ -102,6 +178,24 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
             }
         } catch (e: Exception) {
             log("Enhedsbeskrivelse kunne ikke hentes: ${e.message}")
+            try {
+                val found = search({ }, 2500, host)
+                if (found != null) {
+                    val loc = found.second
+                    log("SSDP-placering: $loc")
+                    val xml = httpGet(loc, 4000, CP_USER_AGENT)
+                    val ctl = findControlUrl(xml)
+                    if (ctl != null) {
+                        val base = URL(URL(loc), ctl)
+                        controlUrl = base.toString()
+                        log("Bruger kontrol-URL $controlUrl")
+                    }
+                } else {
+                    log("Kameraet svarede ikke på SSDP")
+                }
+            } catch (e2: Exception) {
+                log("SSDP-opslag fejlede: ${e2.message}")
+            }
         }
     }
 
@@ -354,13 +448,20 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
 
         /** Leder efter kameraet på netværket via SSDP. Returnerer IP-adresse eller null. */
         fun discover(log: (String) -> Unit, timeoutMs: Int = 3000): String? {
+            val found = search(log, timeoutMs, null)
+            if (found != null) log("Fandt kamera via SSDP: ${found.first}")
+            return found?.first
+        }
+
+        /** SSDP-søgning. Returnerer (IP, LOCATION-URL). Med onlyHost kun svar fra den adresse. */
+        fun search(log: (String) -> Unit, timeoutMs: Int, onlyHost: String?): Pair<String, String>? {
             val msg = ("M-SEARCH * HTTP/1.1\r\n" +
                 "HOST: 239.255.255.250:1900\r\n" +
                 "MAN: \"ssdp:discover\"\r\n" +
                 "MX: 1\r\n" +
                 "ST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n").toByteArray()
             val group = InetAddress.getByName("239.255.255.250")
-            val locationRe = Regex("(?i)location:\\s*http://([^:/\\s]+)(:(\\d+))?")
+            val locationRe = Regex("(?i)location:\\s*(http://([^:/\\s]+)(:(\\d+))?[^\\s]*)")
             try {
                 DatagramSocket().use { s ->
                     s.soTimeout = 700
@@ -373,15 +474,17 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
                             s.receive(pkt)
                             val text = String(pkt.data, 0, pkt.length)
                             val m = locationRe.find(text) ?: continue
-                            val ip = m.groupValues[1]
-                            val port = m.groupValues[3]
+                            val location = m.groupValues[1]
+                            val ip = m.groupValues[2]
+                            val port = m.groupValues[4]
+                            if (onlyHost != null) {
+                                if (ip == onlyHost) return Pair(ip, location)
+                                continue
+                            }
                             val looksLikeLumix = port == "60606" ||
                                 text.contains("panasonic", ignoreCase = true) ||
                                 text.contains("lumix", ignoreCase = true)
-                            if (looksLikeLumix) {
-                                log("Fandt kamera via SSDP: $ip")
-                                return ip
-                            }
+                            if (looksLikeLumix) return Pair(ip, location)
                         } catch (e: SocketTimeoutException) {
                             // fortsæt indtil tiden er gået
                         }

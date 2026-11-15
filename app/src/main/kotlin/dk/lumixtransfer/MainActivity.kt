@@ -342,11 +342,11 @@ class MainActivity : Activity() {
     }
 
     private fun uuid(): String {
-        val existing = prefs.getString("uuid", null)
+        val existing = prefs.getString("uuid2", null)
         if (existing != null) return existing
-        val id = "4D454930-0100-1000-8000-" +
+        val id = "4D454930-0100-1000-8001-" +
             UUID.randomUUID().toString().replace("-", "").take(12).uppercase(Locale.US)
-        prefs.edit().putString("uuid", id).apply()
+        prefs.edit().putString("uuid2", id).apply()
         return id
     }
 
@@ -396,10 +396,15 @@ class MainActivity : Activity() {
                 return
             }
 
-            if (reply.contains("err_reject") || reply.contains("err_busy")) {
-                runOnUiThread {
-                    fail("Kameraet afviste forbindelsen (${if (reply.contains("busy")) "optaget" else "afvist"}). Tjek kameraets skærm, og prøv igen.")
-                }
+            val cameraHost: String = host
+            runOnUiThread {
+                setStatus("Forbinder til kameraet … tjek kameraets skærm, og godkend forbindelsen hvis den spørger")
+            }
+            val approval = CameraClient(cameraHost, logger).awaitApproval(id, {
+                runOnUiThread { setStatus("Venter på at kameraet godkender forbindelsen … tjek kameraets skærm") }
+            }, { false })
+            if (!approval.ok) {
+                runOnUiThread { fail(approval.message) }
                 return
             }
 
