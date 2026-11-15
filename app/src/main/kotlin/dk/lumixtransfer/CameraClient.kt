@@ -48,7 +48,9 @@ data class RemoteFile(
 
 class CameraClient(private val host: String, private val log: (String) -> Unit) {
 
-    private val controlUrl = "http://$host:60606/Server0/CDS_control"
+    private var controlUrl = "http://$host:60606/Server0/CDS_control"
+    private var ua = CP_USER_AGENT
+    private var includePana = true
 
     /**
      * Beder kameraet om adgang. Returnerer kameraets svar, eller null hvis
@@ -69,9 +71,93 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
 
     /** Henter alle filer fra kameraet ved at gå rekursivt gennem mapperne. */
     fun listAll(onProgress: (Int) -> Unit): List<RemoteFile> {
+        prepare()
+        probe()
         val out = ArrayList<RemoteFile>()
         walk("0", out, onProgress, 0)
         return out
+    }
+
+    /** Sætter kameraet i afspilningstilstand og læser enhedsbeskrivelsen. */
+    private fun prepare() {
+        try {
+            val r = httpGet("http://$host/cam.cgi?mode=camcmd&value=playmode", 4000)
+            log("Skift til afspilning: ${r.replace("\n", " ").take(100)}")
+        } catch (e: Exception) {
+            log("Skift til afspilning fejlede: ${e.message}")
+        }
+        try {
+            Thread.sleep(800)
+        } catch (e: InterruptedException) {
+            // ignorer
+        }
+        try {
+            val ddd = httpGet("http://$host:60606/Server0/ddd", 4000, CP_USER_AGENT)
+            log("Enhedsbeskrivelse hentet (${ddd.length} tegn)")
+            val ctl = findControlUrl(ddd)
+            if (ctl != null) {
+                controlUrl = if (ctl.startsWith("http")) ctl else "http://$host:60606" +
+                    (if (ctl.startsWith("/")) ctl else "/$ctl")
+                log("Bruger kontrol-URL $controlUrl")
+            }
+        } catch (e: Exception) {
+            log("Enhedsbeskrivelse kunne ikke hentes: ${e.message}")
+        }
+    }
+
+    private fun findControlUrl(xml: String): String? {
+        return try {
+            val p = Xml.newPullParser()
+            p.setInput(StringReader(xml))
+            var type = ""
+            var ev = p.eventType
+            while (ev != XmlPullParser.END_DOCUMENT) {
+                if (ev == XmlPullParser.START_TAG) {
+                    when (localName(p.name)) {
+                        "serviceType" -> type = p.nextText().trim()
+                        "controlURL" -> {
+                            val u = p.nextText().trim()
+                            if (type.contains("ContentDirectory")) return u
+                        }
+                    }
+                }
+                ev = p.next()
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Prøver flere varianter af første Browse-kald, til kameraet accepterer en af dem. */
+    private fun probe() {
+        val variants = listOf(
+            Pair(CP_USER_AGENT, true),
+            Pair(CP_USER_AGENT, false),
+            Pair(DMS_USER_AGENT, true),
+            Pair("LumixTransfer/1.0", true)
+        )
+        var lastError: Exception? = null
+        for (round in 1..2) {
+            for ((agent, pana) in variants) {
+                ua = agent
+                includePana = pana
+                try {
+                    browse("0", 0, 1)
+                    log("Fillisten svarer (UA=$agent, pana=$pana)")
+                    return
+                } catch (e: IOException) {
+                    lastError = e
+                    log("Browse afvist (UA=$agent, pana=$pana): ${e.message}")
+                }
+            }
+            try {
+                Thread.sleep(2000)
+            } catch (e: InterruptedException) {
+                break
+            }
+        }
+        throw lastError ?: IOException("Kameraet svarer ikke på filliste")
     }
 
     private fun walk(id: String, out: MutableList<RemoteFile>, onProgress: (Int) -> Unit, depth: Int) {
@@ -106,7 +192,8 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
             "<ObjectID>$objectId</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag>" +
             "<Filter>*</Filter><StartingIndex>$start</StartingIndex>" +
             "<RequestedCount>$count</RequestedCount><SortCriteria></SortCriteria>" +
-            "<pana:X_FromCP>LumixLink2.0</pana:X_FromCP></u:Browse></s:Body></s:Envelope>"
+            (if (includePana) "<pana:X_FromCP>LumixLink2.0</pana:X_FromCP>" else "") +
+            "</u:Browse></s:Body></s:Envelope>"
 
         val soap = post(controlUrl, body)
 
@@ -220,11 +307,11 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
 
     private fun localName(n: String?): String = (n ?: "").substringAfter(':')
 
-    private fun httpGet(url: String, timeoutMs: Int): String {
+    private fun httpGet(url: String, timeoutMs: Int, agent: String = "LumixTransfer/1.0"): String {
         val c = URL(url).openConnection() as HttpURLConnection
         c.connectTimeout = timeoutMs
         c.readTimeout = timeoutMs
-        c.setRequestProperty("User-Agent", "LumixTransfer/1.0")
+        c.setRequestProperty("User-Agent", agent)
         try {
             val code = c.responseCode
             val stream = if (code in 200..299) c.inputStream else c.errorStream
@@ -244,13 +331,16 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
         c.doOutput = true
         c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
         c.setRequestProperty("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"")
-        c.setRequestProperty("User-Agent", "LumixTransfer/1.0")
+        c.setRequestProperty("User-Agent", ua)
         try {
             c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val code = c.responseCode
             val stream = if (code in 200..299) c.inputStream else c.errorStream
             val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            if (code !in 200..299) throw IOException("HTTP $code: ${text.take(160)}")
+            if (code !in 200..299) {
+                val server = c.getHeaderField("Server") ?: ""
+                throw IOException("HTTP $code ${server} ${text.replace("\n", " ").take(160)}".trim())
+            }
             return text
         } finally {
             c.disconnect()
@@ -259,6 +349,8 @@ class CameraClient(private val host: String, private val log: (String) -> Unit) 
 
     companion object {
         private const val PAGE_SIZE = 50
+        const val CP_USER_AGENT = "Panasonic MIL DLNA CP UPnP/1.0"
+        const val DMS_USER_AGENT = "Android/1 UPnP/1.0 Panasonic-DM-SV/1"
 
         /** Leder efter kameraet på netværket via SSDP. Returnerer IP-adresse eller null. */
         fun discover(log: (String) -> Unit, timeoutMs: Int = 3000): String? {

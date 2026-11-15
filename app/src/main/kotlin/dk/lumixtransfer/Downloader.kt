@@ -70,7 +70,7 @@ class Downloader(private val context: Context, private val log: (String) -> Unit
                             conn = URL(f.url).openConnection() as HttpURLConnection
                             conn.connectTimeout = 8000
                             conn.readTimeout = 15000
-                            conn.setRequestProperty("User-Agent", "LumixTransfer/1.0")
+                            conn.setRequestProperty("User-Agent", CameraClient.CP_USER_AGENT)
                             if (written > 0) conn.setRequestProperty("Range", "bytes=$written-")
                             val code = conn.responseCode
                             if (written > 0 && code != 206) {
